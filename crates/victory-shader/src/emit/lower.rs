@@ -349,6 +349,103 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
     Some(all)
 }
 
+/// A single console wave filling the group reads a common LDS word in lockstep. When split,
+/// the barriers before LDS accesses (and at lane-region boundaries) preserve that snapshot.
+/// Recognize only an unconditional same-block load, address and compare in a block already
+/// reached by all lanes. Other lane predicates and a guarded register's old value can differ.
+fn shared_word_branch(p: &Program, st: &Structured, b: usize, words: u32) -> bool {
+    let LaneExit::Branch { when, .. } = st.exits[b] else { return false };
+    let mut addresses = HashMap::new();
+    let mut loaded = HashSet::new();
+    let mut compares = HashSet::new();
+    for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+        if st.guards[b][i].is_some() {
+            continue;
+        }
+        match &inst.fields {
+            Fields::Valu(v) if v.dpp.is_none() && v.sdwa.is_none() => {
+                if inst.name() == "v_mov_b32" && v.neg == 0 && v.abs == 0 && v.opsel == 0
+                    && v.omod == 0 && !v.clamp
+                    && let [src] = v.src.as_slice()
+                    && let Some(address) = match *src {
+                        Operand::Const(code @ 128..=192) => Some(u32::from(code - 128)),
+                        Operand::Literal(n) => Some(n),
+                        _ => None,
+                    }
+                    && let Some(Operand::Vector { reg, dwords: 1 }) = v.dst
+                    && let Some(value) = inst.write(Reg::V(reg))
+                {
+                    addresses.insert(value, address);
+                }
+                if matches!(inst.name(), "v_cmp_eq_u32" | "v_cmp_ne_u32")
+                    && v.src.iter().all(|o| match *o {
+                        Operand::Const(128..=192) | Operand::Literal(_) => true,
+                        Operand::Vector { reg, dwords: 1 } => inst.read(Reg::V(reg)).is_some_and(|v| loaded.contains(&v)),
+                        _ => false,
+                    })
+                {
+                    compares.extend(inst.writes.iter().map(|w| w.1));
+                }
+            }
+            Fields::Ds {
+                addr: Some(Operand::Vector { reg: base, dwords: 1 }),
+                dst: Some(Operand::Vector { reg: out, dwords: 1 }), offset0, offset1, gds: false, ..
+            } if inst.name() == "ds_read_b32" => {
+                let offset = u32::from(*offset0) | (u32::from(*offset1) << 8);
+                if inst.read(Reg::V(*base)).and_then(|v| addresses.get(&v))
+                    .and_then(|a| a.checked_add(offset)).is_some_and(|a| a % 4 == 0 && a / 4 < words)
+                    && let Some(value) = inst.write(Reg::V(*out))
+                {
+                    loaded.insert(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    st.bools.support(when).iter().all(|a| match a {
+        Atom::Uniform(_) => true,
+        Atom::Lane(v) => compares.contains(v),
+        _ => false,
+    })
+}
+
+fn on_cycle(p: &Program, start: usize) -> bool {
+    let mut stack = p.blocks[start].exit.successors();
+    let mut seen = vec![false; p.blocks.len()];
+    while let Some(b) = stack.pop() {
+        if b == start {
+            return true;
+        }
+        if !seen[b] {
+            seen[b] = true;
+            stack.extend(p.blocks[b].exit.successors());
+        }
+    }
+    false
+}
+
+fn shared_word_blocks(p: &Program, st: &Structured, all: &[bool], words: u32) -> Option<Vec<bool>> {
+    let mut refined = vec![true; all.len()];
+    let mut changed = false;
+    let regions = lane_regions(st)?;
+    for (b, region) in &regions {
+        // Only remove a branch that runs once, enters with all lanes and encloses
+        // no other lane branch. Any loops it encloses must have uniform control.
+        if all[*b]
+            && shared_word_branch(p, st, *b, words)
+            && !regions.iter().any(|(other, _)| region[*other])
+            && !on_cycle(p, *b)
+        {
+            changed = true;
+        } else {
+            for (r, &blocked) in refined.iter_mut().zip(region) {
+                *r &= !blocked;
+            }
+        }
+    }
+    changed.then_some(refined)
+}
+
 /// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
 /// not post-dominate it, which only some lanes run. Not the branches the wave takes together
 /// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
@@ -1303,7 +1400,7 @@ impl<'a> Lower<'a> {
                         matches!(i.fields, Fields::Ds { .. })
                             && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
                     };
-                    if let Some(all) = all_lane_blocks(x.st) {
+                    if let Some(mut all) = all_lane_blocks(x.st) {
                         let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
                             blk.insts.iter().all(|inst| {
                                 !lds(inst) || all.get(b).copied().unwrap_or(false)
@@ -1311,6 +1408,14 @@ impl<'a> Lower<'a> {
                         });
                         let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
                         if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
+                            lds_meet = Some((all.clone(), meet));
+                            lds_ok = true;
+                        }
+                        if !lds_ok && group == 64 && meeting_mode() & 1 != 0
+                            && let Some(refined) = shared_word_blocks(p, x.st, &all, s.lds_dwords)
+                            && let Some(meet) = lds_meetings(p, x.st, &refined)
+                        {
+                            all = refined;
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
                         }
@@ -10761,6 +10866,53 @@ mod tests {
     const S_ENDPGM: u32 = 0xBF81_0000;
 
     #[test]
+    fn branch_on_a_common_lds_word_keeps_group_barriers_converged() {
+        fn lower_case(setup: &[u32], offset: u32, threads: u32, repeat: bool) -> Option<u32> {
+            let mut words = vec![
+                0xBE80_0381, // s_mov_b32 s0, 1
+                0x340A_0082, // v_lshlrev_b32 v5, 2, v0: a separate word for each thread
+                0xD834_0000, 0x0000_0005, // ds_write_b32 v5, v0
+            ];
+            let header = words.len();
+            words.extend_from_slice(setup);
+            words.extend_from_slice(&[
+                0xD8D8_0000 | offset, 0x0200_0001, // ds_read_b32 v2, v1 offset:offset
+                0x7D84_0480,                  // v_cmp_eq_u32 vcc, 0, v2
+                0xBF87_0004,                  // s_cbranch_vccnz end
+                0xD834_0000, 0x0000_0101,     // ds_write_b32 v1, v1
+                0xD8D8_0000, 0x0300_0001,     // ds_read_b32 v3, v1
+                0xD760_0007, 0x0001_0101,     // v_readlane_b32 s7, v1, 0
+            ]);
+            if repeat {
+                words.push(0xBF06_8000); // s_cmp_eq_u32 s0, 0
+                let back = header as i16 - (words.len() as i16 + 1);
+                words.push(0xBF85_0000 | u32::from(back as u16)); // s_cbranch_scc1 back to the setup
+            }
+            words.push(S_ENDPGM);
+            let previous = super::TEST_HOST_WAVE.replace(Some(32));
+            let result = lower_wave_group(&words, vec![], vec![], true, [threads, 1, 1]);
+            super::TEST_HOST_WAVE.set(previous);
+            result.unwrap().wave_size
+        }
+        let wave = |setup, offset, threads| lower_case(setup, offset, threads, false);
+        assert_eq!(lower_case(&[0x7E02_0280], 0, 64, true), Some(64), "re-entered condition");
+        assert_eq!(wave(&[0x7E02_0280], 0, 64), Some(32), "all lanes read the same word");
+        assert_eq!(wave(&[0x7E02_0280], 4, 64), Some(32), "nonzero shared word");
+        assert_eq!(wave(&[0x3402_0082], 0, 64), Some(64), "the address depends on the lane");
+        let masked_base = [
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        ];
+        assert_eq!(wave(&masked_base, 0, 64), Some(64), "inactive lanes keep their prior address");
+        assert_eq!(wave(&[0x7E02_0280], 2, 64), Some(64), "misaligned word");
+        assert_eq!(wave(&[0x7E02_0280], 512, 64), Some(64), "word beyond the group allocation");
+        assert_eq!(wave(&[0x7E02_0280], 0, 128), Some(64), "two independent console waves");
+    }
+
+    #[test]
     fn packed_pixel_inputs_find_their_second_row() {
         use super::super::container::SigElement;
         use super::half_input_partners;
@@ -10932,6 +11084,16 @@ mod tests {
         used: Vec<UsedResource>,
         wave64: bool,
     ) -> Result<Lowered, crate::ShaderError> {
+        lower_wave_group(words, layout, used, wave64, [1, 1, 1])
+    }
+
+    fn lower_wave_group(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+        wave64: bool,
+        threads: [u32; 3],
+    ) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
         let native = NativeProgram {
@@ -10943,7 +11105,7 @@ mod tests {
             io: StageIo::Cs(ComputeIo {
                 // The layout's user SGPRs (at least two), 512 bytes of LDS.
                 rsrc2: 1 << 15 | sgprs.max(2) << 1,
-                threads: [1, 1, 1],
+                threads,
             }),
             code,
         };
