@@ -92,6 +92,15 @@ impl Last {
         self.hash = Some(hash);
         changed
     }
+
+    /// Copies the whole remapping texture into scratch. An incomplete copy
+    /// leaves the last successful hash and its write-watch history intact.
+    fn read_unlocked(&mut self, memory: *const u8, scratch: &mut [u8], unwritten: bool) -> Option<bool> {
+        if !crate::host::read_into(memory, scratch) {
+            return None;
+        }
+        Some(self.hashed(blake3::hash(scratch), unwritten))
+    }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -696,7 +705,7 @@ impl Staging {
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
             let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
+                return self.refresh_unlocked(last, size, unwritten);
             };
             mapped
         } else {
@@ -774,15 +783,14 @@ impl Staging {
     /// is looked at again at its next refresh (what was learnt about writes
     /// to it is forgotten, so that it is not passed over as unwritten).
     /// Returns the bytes read.
-    fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
+    fn refresh_unlocked(&self, last: &mut Last, size: usize, unwritten: bool) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let read = with_read(size, |read| {
-            if !crate::host::read_into(self.memory, read) {
+            let Some(changed) = last.read_unlocked(self.memory, read, unwritten) else {
                 return false;
-            }
-            let hash = blake3::hash(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
+            };
+            if changed {
+                self.seen_late(last, unwritten);
                 self.detile(read);
             }
             true
@@ -1102,6 +1110,30 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod unseen_tests {
     use super::Last;
+
+    #[test]
+    fn an_unlocked_read_tracks_changes_no_write_was_seen_for() {
+        let mut last = Last::default();
+        let mut source = [0u8; 16];
+        let mut scratch = [0; 16];
+
+        assert_eq!(last.read_unlocked(source.as_ptr(), &mut scratch, true), Some(true));
+        assert_eq!(last.unseen, 0, "the first snapshot is not an unseen change");
+        source[7] = 1;
+        assert_eq!(last.read_unlocked(source.as_ptr(), &mut scratch, false), Some(true));
+        assert_eq!(last.unseen, 0, "a reported write does not arm extra checks");
+
+        source[8] = 2;
+        assert_eq!(last.read_unlocked(source.as_ptr(), &mut scratch, true), Some(true));
+        assert_eq!(scratch, source);
+        assert_eq!(last.unseen, Last::UNSEEN, "the remapped snapshot changed unseen");
+        assert_eq!(last.read_unlocked(source.as_ptr(), &mut scratch, true), Some(false));
+        assert_eq!(last.unseen, Last::UNSEEN - 1);
+
+        let before = (last.hash, last.unseen);
+        assert_eq!(last.read_unlocked(std::ptr::null(), &mut scratch, true), None);
+        assert_eq!((last.hash, last.unseen), before, "a failed read preserves the last snapshot");
+    }
 
     /// A texture that changes with no write seen is hashed at each check for
     /// a while; one whose changes are seen, or that stays the same, is not.
