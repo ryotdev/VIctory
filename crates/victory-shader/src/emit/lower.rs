@@ -540,6 +540,16 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool], threads: Option<[u32
                         _ => true,
                     })
                 };
+                // Even a wave-uniform guard can be false. The lanes then keep the old
+                // destination, which may differ between the two halves of a console wave.
+                if st.guards[b][i].is_some()
+                    && inst.writes.iter().any(|&(reg, _)| {
+                        matches!(reg, Reg::V(_))
+                            && inst.read(reg).is_some_and(|old| !same.contains(&old))
+                    })
+                {
+                    continue;
+                }
                 // a read of the group's LDS at an address the lanes agree on
                 if let Fields::Ds { dst: Some(_), addr: Some(addr), gds: false, .. } = &inst.fields
                     && name == "ds_read_b32"
@@ -10923,6 +10933,52 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn a_guarded_uniform_write_can_keep_different_values_in_each_lane() {
+        use crate::ir::Reg;
+
+        let check = |initial: u32, write: &[u32]| {
+            let mut words = vec![
+                initial,     // v_mov_b32 v1, v0 (thread ID) or 0
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0x7D88_0400, // v_cmp_gt_u32 vcc, s0, v2
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            ];
+            words.extend_from_slice(write);
+            words.extend_from_slice(&[
+                0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+                0x7E0E_0501, // v_readfirstlane_b32 s7, v1
+                S_ENDPGM,
+            ]);
+            let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = ir::build(&code, true, 8).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let all = super::all_lane_blocks(&st).unwrap();
+            let uniform = super::lane_uniform(&p, &st, &all, Some([64, 1, 1]));
+            let read = p
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .find(|i| i.name() == "v_readfirstlane_b32")
+                .unwrap();
+            uniform.contains(&read.read(Reg::V(1)).unwrap())
+        };
+
+        let writes: &[(&str, &[u32])] = &[
+            ("v_mov_b32 v1, 1", &[0x7E02_0281]),
+            ("v_lshrrev_b32 v1, 6, v0", &[0x2C02_0086]),
+            ("ds_read_b32 v1, v2", &[0xD8D8_0000, 0x0100_0002]),
+        ];
+        let mut divergent = Vec::new();
+        for &(name, write) in writes {
+            assert!(check(0x7E02_0280, write), "{name}: old and new values are uniform");
+            if check(0x7E02_0300, write) {
+                divergent.push(name);
+            }
+        }
+        assert!(divergent.is_empty(), "when s0 is zero, lanes keep their IDs: {divergent:?}");
+    }
 
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {
