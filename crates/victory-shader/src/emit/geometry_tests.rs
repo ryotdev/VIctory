@@ -246,6 +246,37 @@ fn reference_draw(params: bool) {
 }
 
 #[test]
+fn geometry_copy_rejects_a_change_to_the_active_lanes() {
+    let native = crate::native_programs(&geometry_part())
+        .unwrap()
+        .pop()
+        .unwrap();
+    let program = native.translation_ir().unwrap();
+    let crate::native::StageIo::Gs(mut geometry) = native.io else {
+        panic!("missing GS data");
+    };
+    let original = geometry.copy.code.clone();
+    let mut with_mov = |mov| {
+        geometry.copy.code = bytes(&[mov]);
+        geometry.copy.code.extend_from_slice(&original);
+        crate::geometry::raise(&program, &geometry)
+    };
+    with_mov(0xbe94_0380).unwrap(); // s_mov_b32 s20, 0
+    for mov in [0xbefe_0380, 0xbeff_0380] {
+        // s_mov_b32 exec_lo / exec_hi, 0
+        let error =
+            with_mov(mov).expect_err("masked copy exports cannot be emitted unconditionally");
+        assert!(matches!(
+            error,
+            crate::ShaderError::Unsupported {
+                offset: 0,
+                what: "a geometry copy execution mask"
+            }
+        ));
+    }
+}
+
+#[test]
 fn geometry_copy_rejects_untraced_reads_and_exports() {
     let native = crate::native_programs(&geometry_part())
         .unwrap()

@@ -182,6 +182,16 @@ struct CopyExport {
 fn copy_exports(gs: &GeometryIo) -> Result<Vec<CopyExport>, ShaderError> {
     let copy = &gs.copy;
     let p = ir::build(&copy.code, copy.wave64, copy.vgprs)?;
+    // Each translated EMIT runs the same copy exports for every active invocation.
+    // An EXEC write in the copy can suppress those exports for individual lanes.
+    if let Some(i) = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find(|i| i.writes.iter().any(|(r, _)| matches!(r, Reg::S(126 | 127))))
+    {
+        return Err(fail(i, "a geometry copy execution mask"));
+    }
     // Stream-zero copies either execute straight through or branch directly
     // to endpgm when the stream number in s3[31:24] is nonzero.
     let body = match p.blocks.as_slice() {
