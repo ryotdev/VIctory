@@ -10660,7 +10660,7 @@ mod tests {
 
 /// Whether translated shaders mark the heap slots they read
 /// (`VICTORY_HEAP_USAGE`, on unless 0). Off, shaders are as before.
-fn heap_usage_marks() -> bool {
+pub fn heap_usage_marks() -> bool {
     // shortcut: off in unit tests, whose hardware harness binds only the
     // root parameters each test names (the bitmap would be unbound).
     if cfg!(test) {

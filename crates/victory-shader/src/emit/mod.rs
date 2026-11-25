@@ -177,6 +177,7 @@ mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+pub use lower::heap_usage_marks;
 mod rect;
 pub use rect::rectangle_gs;
 #[cfg(all(test, windows))]

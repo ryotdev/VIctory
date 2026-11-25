@@ -210,7 +210,7 @@ pub(crate) fn usage_bitmap(list: &crate::host::HostList, heap: usize) -> Option<
     list.defer_after(move || {
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
-        let on = heap_usage_on() && heap != 0;
+        let on = victory_shader::emit::heap_usage_marks() && heap != 0;
         if heap == 0 {
             USAGE.2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -244,12 +244,6 @@ pub(crate) fn take_usage() -> (u64, u64) {
 #[cfg(windows)]
 pub(crate) static USAGE: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64) =
     (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0));
-
-#[cfg(windows)]
-fn heap_usage_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_HEAP_USAGE").map_or(true, |v| v != "0"))
-}
 
 /// Makes the views of slots `used` of the title view heap `heap` that the
 /// host left null for later (placed textures); how many it made.
